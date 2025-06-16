@@ -177,3 +177,4 @@ if __name__ == "__main__":
     main()
 
     # Test
+    #"AI 리뷰어 테스트"

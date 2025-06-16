@@ -281,3 +281,4 @@ def click_first_pocket_order_payment(driver):
         return False
     
     # Test
+    #"AI 리뷰어 테스트"
