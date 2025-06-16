@@ -1,0 +1,59 @@
+name: 🤖 AI Code Reviewer
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Get PR Diff
+        id: get_diff
+        run: |
+          git fetch origin ${{ github.event.pull_request.base.ref }}
+          git fetch origin ${{ github.event.pull_request.head.ref }}
+          diff_output=$(git diff origin/${{ github.event.pull_request.base.ref }}...origin/${{ github.event.pull_request.head.ref }})
+          echo "diff<<EOF" >> $GITHUB_OUTPUT
+          echo "$diff_output" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Call Gemini API for Code Summary
+        id: call_gemini
+        run: |
+          response=$(curl -s -H 'Content-Type: application/json' \
+            -d '{
+                  "contents": [{
+                    "parts": [{
+                      "text": "당신은 전문 코드 리뷰어입니다. 다음 git diff 내용을 분석해서 한국어로 내용을 요약해주세요. 어떤 코드가 추가/변경되었고, 주요 변경 목적이 무엇인지 마크다운 형식으로 설명해주세요. 제목은 ''🤖 AI 코드 리뷰 요약''으로 시작하고, 답변 마지막 줄에는 반드시 ''📄 Note: 이 요약은 Google Gemini 1.5 Flash 모델을 사용하여 생성되었습니다.'' 라는 문구를 추가해주세요.\n\n```diff\n${{ steps.get_diff.outputs.diff }}\n```"
+                    }]
+                  }]
+                }' \
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${{ secrets.GEMINI_API_KEY }}")
+          
+          summary=$(echo "$response" | jq -r '.candidates[0].content.parts[0].text')
+
+          echo "summary<<EOF" >> $GITHUB_OUTPUT
+          echo "$summary" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          
+      - name: Post Comment to PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `${{ steps.call_gemini.outputs.summary }}`
+            });
