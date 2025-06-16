@@ -1,0 +1,69 @@
+name: 🤖 AI Code Reviewer
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Get PR Diff
+        id: get_diff
+        run: |
+          git fetch origin ${{ github.event.pull_request.base.ref }}
+          git fetch origin ${{ github.event.pull_request.head.ref }}
+          git diff origin/${{ github.event.pull_request.base.ref }}...origin/${{ github.event.pull_request.head.ref }} > diff.txt
+          echo "diff_path=diff.txt" >> "$GITHUB_OUTPUT"
+
+      - name: Read Diff to Variable
+        id: read_diff
+        run: |
+          DIFF_CONTENT=$(head -c 15000 diff.txt)
+          DIFF_JSON=$(jq -Rs '.' <<< "$DIFF_CONTENT")
+          echo "diff_json=$DIFF_JSON" >> "$GITHUB_OUTPUT"
+
+      - name: Call Gemini API
+        id: call_gemini
+        run: |
+          DIFF_JSON="${{ steps.read_diff.outputs.diff_json }}"
+
+          BODY=$(jq -n --arg diff "$DIFF_JSON" '{
+            contents: [{
+              parts: [{
+                text: "당신은 전문 코드 리뷰어입니다. 다음 git diff 내용을 분석해서 한국어로 내용을 요약해주세요. 어떤 코드가 추가/변경되었고, 주요 변경 목적이 무엇인지 마크다운 형식으로 설명해주세요. 제목은 '🤖 AI 코드 리뷰 요약'으로 시작하고, 마지막 줄에는 반드시 '📄 Note: 이 요약은 Google Gemini 1.5 Flash 모델을 사용하여 생성되었습니다.' 라는 문구를 추가해주세요.\n\n```diff\n\($diff)\n```"
+              }]
+            }]
+          }')
+
+          RESPONSE=$(curl -s -X POST "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${{ secrets.GEMINI_API_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d "$BODY")
+
+          echo "response=$RESPONSE" >> "$GITHUB_OUTPUT"
+
+      - name: Extract Gemini Response
+        id: parse_gemini
+        run: |
+          echo "${{ steps.call_gemini.outputs.response }}" | jq -r '.candidates[0].content.parts[0].text // "❗ Gemini 응답을 가져오지 못했습니다."' > summary.txt
+          echo "summary<<EOF" >> "$GITHUB_OUTPUT"
+          cat summary.txt >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Post AI Review as Comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `${{ steps.parse_gemini.outputs.summary }}`
+            })
