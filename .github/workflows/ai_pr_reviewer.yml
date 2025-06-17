@@ -60,7 +60,7 @@ jobs:
             --arg prompt "$PROMPT" \
             --arg diff "${{ steps.get_diff.outputs.diff }}" \
             '{
-              "model": "gpt-4o",
+              "model": "gpt-3.5-turbo",
               "messages": [
                 {"role": "system", "content": $prompt},
                 {"role": "user", "content": $diff}
