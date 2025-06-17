@@ -176,5 +176,4 @@ def main():
 if __name__ == "__main__":
     main()
 
-    # Test
-    #"AI 리뷰어 테스트"
+#test2dssdsd제발되자 쫌

@@ -1,69 +1,83 @@
-name: 🤖 AI Code Reviewer
+name: 🤖 AI PR Reviewer
 
 on:
   pull_request:
-    types: [opened, synchronize]
+    types: [opened, synchronize, reopened]
 
 jobs:
   review:
-    runs-on: ubuntu-latest
     permissions:
-      contents: read
       pull-requests: write
-
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout Repository
+      - name: Checkout PR code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Get PR Diff
+      - name: Get PR diff
         id: get_diff
         run: |
-          git fetch origin ${{ github.event.pull_request.base.ref }}
-          git fetch origin ${{ github.event.pull_request.head.ref }}
-          git diff origin/${{ github.event.pull_request.base.ref }}...origin/${{ github.event.pull_request.head.ref }} > diff.txt
-          echo "diff_path=diff.txt" >> "$GITHUB_OUTPUT"
+          # PR 대상 브랜치와 현재 브랜치 비교
+          diff_output=$(git diff origin/${{ github.base_ref }}...HEAD)
+          echo "diff<<EOF" >> $GITHUB_OUTPUT
+          echo "$diff_output" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
 
-      - name: Read Diff to Variable
-        id: read_diff
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Call OpenAI API
+        id: openai
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
-          DIFF_CONTENT=$(head -c 15000 diff.txt)
-          DIFF_JSON=$(jq -Rs '.' <<< "$DIFF_CONTENT")
-          echo "diff_json=$DIFF_JSON" >> "$GITHUB_OUTPUT"
+          set -e
 
-      - name: Call Gemini API
-        id: call_gemini
-        run: |
-          DIFF_JSON="${{ steps.read_diff.outputs.diff_json }}"
+          PROMPT="You are a senior QA engineer. Analyze the following code diff and provide a concise review comment in Korean. Mention bugs, improvements, or risks if any."
 
-          BODY=$(jq -n --arg diff "$DIFF_JSON" '{
-            contents: [{
-              parts: [{
-                text: "당신은 전문 코드 리뷰어입니다. 다음 git diff 내용을 분석해서 한국어로 내용을 요약해주세요. 어떤 코드가 추가/변경되었고, 주요 변경 목적이 무엇인지 마크다운 형식으로 설명해주세요. 제목은 '🤖 AI 코드 리뷰 요약'으로 시작하고, 마지막 줄에는 반드시 '📄 Note: 이 요약은 Google Gemini 1.5 Flash 모델을 사용하여 생성되었습니다.' 라는 문구를 추가해주세요.\n\n```diff\n\($diff)\n```"
-              }]
-            }]
-          }')
+          JSON_PAYLOAD=$(jq -n \
+            --arg prompt "$PROMPT" \
+            --arg diff "${{ steps.get_diff.outputs.diff }}" \
+            '{
+              "model": "gpt-3.5-turbo",
+              "messages": [
+                {"role": "system", "content": $prompt},
+                {"role": "user", "content": $diff}
+              ]
+            }')
 
-          RESPONSE=$(curl -s -X POST "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${{ secrets.GEMINI_API_KEY }}" \
+          echo "--- Sending a request to OpenAI... ---"
+          echo "$JSON_PAYLOAD"
+
+          curl -s https://api.openai.com/v1/chat/completions \
             -H "Content-Type: application/json" \
-            -d "$BODY")
+            -H "Authorization: Bearer $OPENAI_API_KEY" \
+            -d "$JSON_PAYLOAD" > response.json
 
-          echo "response=$RESPONSE" >> "$GITHUB_OUTPUT"
+          echo "--- Received a raw response from OpenAI ---"
+          cat response.json
 
-      - name: Extract Gemini Response
-        id: parse_gemini
-        run: |
-          echo "${{ steps.call_gemini.outputs.response }}" | jq -r '.candidates[0].content.parts[0].text // "❗ Gemini 응답을 가져오지 못했습니다."' > summary.txt
-          echo "summary<<EOF" >> "$GITHUB_OUTPUT"
-          cat summary.txt >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
+          if jq -e .error < response.json > /dev/null; then
+            ERROR_MESSAGE=$(jq -r .error.message < response.json)
+            MESSAGE="### ❗ AI 리뷰 생성 실패\n\n**원인:** ${ERROR_MESSAGE}"
+          else
+            MESSAGE=$(jq -r '.choices[0].message.content' < response.json)
+          fi
+
+          echo "$MESSAGE" > summary.txt
+          echo "summary_path=summary.txt" >> $GITHUB_OUTPUT
 
       - name: Post AI Review as Comment
         uses: actions/github-script@v7
         with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            github.rest.issues.createComment({
+            const fs = require('fs');
+            const summary = fs.readFileSync('${{ steps.openai.outputs.summary_path }}', 'utf8');
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
               owner: context.repo.owner,
               repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body: `${{ steps.parse_gemini.outputs.summary }}`
-            })
+              body: summary
+            });
