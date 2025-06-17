@@ -1,84 +1,3 @@
-# name: 🤖 AI PR Reviewer
-
-# on:
-#   pull_request:
-#     types: [opened, synchronize, reopened]
-
-# jobs:
-#   review:
-#     # GitHub 토큰에 댓글 쓰기 권한을 부여합니다.
-#     permissions:
-#       pull-requests: write
-#     runs-on: ubuntu-latest
-#     steps:
-#       - name: Checkout PR code
-#         uses: actions/checkout@v4
-#         with:
-#           # diff를 위해 비교할 브랜치의 전체 기록을 가져옵니다.
-#           fetch-depth: 0
-
-#       - name: Get PR diff
-#         id: get_diff
-#         run: |
-#           # PR의 대상 브랜치와 현재 브랜치를 비교하여 변경 사항을 추출합니다.
-#           diff_output=$(git diff origin/${{ github.base_ref }}...HEAD)
-          
-#           # 다음 단계에서 사용할 수 있도록 diff 내용을 저장합니다.
-#           echo "diff<<EOF" >> $GITHUB_OUTPUT
-#           echo "$diff_output" >> $GITHUB_OUTPUT
-#           echo "EOF" >> $GITHUB_OUTPUT
-
-#       - name: Call OpenAI API
-#         id: openai
-#         env:
-#           # GitHub Secrets에 등록된 OpenAI API 키를 사용합니다.
-#           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-#         run: |
-#           # 프롬프트를 구성합니다.
-#           PROMPT="You are a senior QA engineer. Analyze the following code diff and provide a concise review comment in Korean. Mention bugs, improvements, or risks if any."
-          
-#           # JSON 요청 본문을 만듭니다. 따옴표 문제를 피하기 위해 jq를 사용합니다.
-#           JSON_PAYLOAD=$(jq -n \
-#             --arg prompt "$PROMPT" \
-#             --arg diff "${{ steps.get_diff.outputs.diff }}" \
-#             '{
-#               "model": "gpt-4o",
-#               "messages": [
-#                 {"role": "system", "content": $prompt},
-#                 {"role": "user", "content": $diff}
-#               ]
-#             }')
-
-#           # OpenAI API를 호출하고 응답을 파일에 저장합니다.
-#           curl -s https://api.openai.com/v1/chat/completions \
-#             -H "Content-Type: application/json" \
-#             -H "Authorization: Bearer $OPENAI_API_KEY" \
-#             -d "$JSON_PAYLOAD" > response.json
-            
-#           # 응답에서 리뷰 내용만 추출하여 summary.txt 파일에 저장합니다.
-#           # 응답이 실패할 경우를 대비해 기본 메시지를 설정합니다.
-#           MESSAGE=$(cat response.json | jq -r '.choices[0].message.content // "❗ OpenAI 응답을 받아오는데 실패했습니다."')
-#           echo "$MESSAGE" > summary.txt
-          
-#           # 마지막 단계에서 사용할 파일 경로를 저장합니다.
-#           echo "summary_path=summary.txt" >> "$GITHUB_OUTPUT"
-
-#       - name: Install JQ
-#         run: sudo apt-get update && sudo apt-get install -y jq
-
-#       - name: Post AI Review as Comment
-#         uses: actions/github-script@v7
-#         with:
-#           github-token: ${{ secrets.GITHUB_TOKEN }}
-#           script: |
-#             const fs = require('fs');
-#             const summary = fs.readFileSync('${{ steps.openai.outputs.summary_path }}', 'utf8');
-#             github.rest.issues.createComment({
-#               issue_number: context.issue.number,
-#               owner: context.repo.owner,
-#               repo: context.repo.repo,
-#               body: summary
-#             });
 name: 🤖 AI PR Reviewer
 
 on:
@@ -100,9 +19,8 @@ jobs:
         id: get_diff
         run: |
           diff_output=$(git diff origin/${{ github.base_ref }}...HEAD)
-          echo "diff<<EOF" >> $GITHUB_OUTPUT
-          echo "$diff_output" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+          echo "$diff_output" > pr_diff.txt
+          echo "Diff length: ${#diff_output}"  # 로그로 확인용
 
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
@@ -112,11 +30,16 @@ jobs:
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
+          if [ ! -s pr_diff.txt ]; then
+            echo "❗ Diff가 비어 있어 OpenAI 호출을 건너뜁니다." > summary.txt
+            exit 0
+          fi
+
           PROMPT="You are a senior QA engineer. Analyze the following code diff and provide a concise review comment in Korean. Mention bugs, improvements, or risks if any."
           
           JSON_PAYLOAD=$(jq -n \
             --arg prompt "$PROMPT" \
-            --arg diff "${{ steps.get_diff.outputs.diff }}" \
+            --arg diff "$(cat pr_diff.txt)" \
             '{
               "model": "gpt-4o",
               "messages": [
@@ -129,17 +52,13 @@ jobs:
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer $OPENAI_API_KEY" \
             -d "$JSON_PAYLOAD" > response.json
-            
-          # --- ❗ 디버깅을 위한 로그 출력 단계 (새로 추가됨) ---
+
           echo "--- OpenAI API Raw Response ---"
           cat response.json
           echo "---------------------------------"
-          # --- ❗ 여기까지 새로 추가된 부분 ---
 
-          MESSAGE=$(cat response.json | jq -r '.choices[0].message.content // "❗ OpenAI 응답을 받아오는데 실패했습니다. 자세한 내용은 Actions 로그를 확인하세요."')
+          MESSAGE=$(jq -r '.choices[0].message.content // "❗ OpenAI 응답을 받아오지 못했습니다."' response.json)
           echo "$MESSAGE" > summary.txt
-          
-          echo "summary_path=summary.txt" >> "$GITHUB_OUTPUT"
 
       - name: Post AI Review as Comment
         uses: actions/github-script@v7
@@ -147,11 +66,10 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const fs = require('fs');
-            const summary = fs.readFileSync('${{ steps.openai.outputs.summary_path }}', 'utf8');
+            const summary = fs.readFileSync('summary.txt', 'utf8');
             github.rest.issues.createComment({
               issue_number: context.issue.number,
               owner: context.repo.owner,
               repo: context.repo.repo,
               body: summary
             });
-#ㄴㅇ
