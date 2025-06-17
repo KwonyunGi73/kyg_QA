@@ -1,45 +1,64 @@
+# 워크플로우의 이름
 name: 🤖 AI PR Reviewer
 
+# 워크플로우 실행 조건: PR이 열리거나, 업데이트되거나, 다시 열렸을 때
 on:
   pull_request:
     types: [opened, synchronize, reopened]
 
+# 실행될 작업(Job) 목록
 jobs:
   review:
+    # 이 작업이 PR에 댓글을 쓸 수 있도록 권한을 부여합니다.
     permissions:
       pull-requests: write
+    # 최신 우분투 환경에서 실행됩니다.
     runs-on: ubuntu-latest
+    # 작업의 단계(Step)들
     steps:
+      # 1. 코드 체크아웃
+      # git diff를 원활하게 실행하기 위해 전체 git 기록을 가져옵니다 (fetch-depth: 0).
       - name: Checkout PR code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
+      # 2. 변경된 내용(diff) 추출
       - name: Get PR diff
         id: get_diff
         run: |
+          # PR의 대상 브랜치(e.g., main)와 현재 브랜치를 비교하여 변경 사항을 추출합니다.
           diff_output=$(git diff origin/${{ github.base_ref }}...HEAD)
-          echo "$diff_output" > pr_diff.txt
-          echo "Diff length: ${#diff_output}"  # 로그로 확인용
+          
+          # 다음 단계에서 사용할 수 있도록 diff 내용을 저장합니다.
+          # 히어독(EOF)을 사용하여 여러 줄의 내용도 문제없이 처리합니다.
+          echo "diff<<EOF" >> $GITHUB_OUTPUT
+          echo "$diff_output" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
 
+      # 3. jq 도구 설치
+      # JSON 데이터를 처리하기 위해 jq를 설치합니다.
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
 
+      # 4. OpenAI API 호출 및 응답 처리
       - name: Call OpenAI API
         id: openai
         env:
+          # GitHub Secrets에 등록된 OpenAI API 키를 사용합니다.
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
-          if [ ! -s pr_diff.txt ]; then
-            echo "❗ Diff가 비어 있어 OpenAI 호출을 건너뜁니다." > summary.txt
-            exit 0
-          fi
-
+          # 스크립트 실행 중 오류가 발생하면 즉시 중단하도록 설정합니다.
+          set -e
+          
+          # AI에게 전달할 시스템 메시지 (역할 부여)
           PROMPT="You are a senior QA engineer. Analyze the following code diff and provide a concise review comment in Korean. Mention bugs, improvements, or risks if any."
           
+          # jq를 사용하여 안전하게 JSON 요청 본문을 생성합니다.
+          # 이렇게 하면 diff 내용에 특수문자가 있어도 오류가 발생하지 않습니다.
           JSON_PAYLOAD=$(jq -n \
             --arg prompt "$PROMPT" \
-            --arg diff "$(cat pr_diff.txt)" \
+            --arg diff "${{ steps.get_diff.outputs.diff }}" \
             '{
               "model": "gpt-4o",
               "messages": [
@@ -48,25 +67,44 @@ jobs:
               ]
             }')
 
+          # 디버깅: API에 보낼 요청 내용을 로그에 출력합니다.
+          echo "--- Sending a request to OpenAI... ---"
+          echo "$JSON_PAYLOAD"
+          
+          # curl을 사용해 OpenAI API를 호출하고, 응답을 response.json 파일에 저장합니다.
           curl -s https://api.openai.com/v1/chat/completions \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer $OPENAI_API_KEY" \
             -d "$JSON_PAYLOAD" > response.json
 
-          echo "--- OpenAI API Raw Response ---"
+          # 디버깅: OpenAI로부터 받은 응답 원본을 로그에 출력합니다.
+          echo "--- Received a raw response from OpenAI ---"
           cat response.json
-          echo "---------------------------------"
-
-          MESSAGE=$(jq -r '.choices[0].message.content // "❗ OpenAI 응답을 받아오지 못했습니다."' response.json)
+          
+          # OpenAI 응답에 "error" 객체가 있는지 확인합니다.
+          if jq -e .error < response.json > /dev/null; then
+            # 에러가 있다면, 에러 메시지를 추출하여 리뷰 내용으로 설정합니다.
+            ERROR_MESSAGE=$(jq -r .error.message < response.json)
+            MESSAGE="### ❗ AI 리뷰 생성 실패\n\n**원인:** ${ERROR_MESSAGE}"
+          else
+            # 에러가 없다면, 정상적인 리뷰 내용을 추출합니다.
+            MESSAGE=$(jq -r '.choices[0].message.content' < response.json)
+          fi
+          
+          # 최종 리뷰 내용을 summary.txt 파일에 저장합니다.
           echo "$MESSAGE" > summary.txt
+          
+          # 다음 단계에서 사용할 파일 경로를 저장합니다.
+          echo "summary_path=summary.txt" >> "$GITHUB_OUTPUT"
 
+      # 5. AI 리뷰를 PR에 코멘트로 작성
       - name: Post AI Review as Comment
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const fs = require('fs');
-            const summary = fs.readFileSync('summary.txt', 'utf8');
+            const summary = fs.readFileSync('${{ steps.openai.outputs.summary_path }}', 'utf8');
             github.rest.issues.createComment({
               issue_number: context.issue.number,
               owner: context.repo.owner,
