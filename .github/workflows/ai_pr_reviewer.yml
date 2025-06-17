@@ -1,71 +1,83 @@
+# 워크플로우의 이름
 name: 🤖 AI PR Reviewer
 
+# 워크플로우 실행 조건: PR이 열리거나, 업데이트되거나, 다시 열렸을 때
 on:
   pull_request:
     types: [opened, synchronize, reopened]
 
+# 실행될 작업(Job) 목록
 jobs:
   review:
+    # 이 작업이 PR에 댓글을 쓸 수 있도록 권한을 부여합니다.
     permissions:
       pull-requests: write
+    # 최신 우분투 환경에서 실행됩니다.
     runs-on: ubuntu-latest
+    # 작업의 단계(Step)들
     steps:
+      # 1. 코드 체크아웃
+      # git diff를 원활하게 실행하기 위해 전체 git 기록을 가져옵니다 (fetch-depth: 0).
       - name: Checkout PR code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # [수정된 부분] PR 제목에 따라 '전체 리뷰' 또는 '변경점 리뷰'를 선택합니다.
-      - name: Get Review Content
-        id: get_content
+      # 2. 리뷰할 콘텐츠 준비
+      - name: Prepare Review Content
+        id: prepare_content
         run: |
-          # 기본적으로 변경점(diff)을 가져옵니다.
+          # 기본적으로 변경점(diff)을 리뷰하도록 설정합니다.
           REVIEW_CONTENT=$(git diff origin/${{ github.base_ref }}...HEAD)
           REVIEW_TYPE="변경점"
 
-          # 만약 PR 제목에 '[전체 리뷰]'가 포함되어 있다면,
+          # 만약 PR 제목에 '[전체 리뷰]'가 포함되어 있다면, 전체 파일 리뷰 모드로 전환합니다.
           if [[ "${{ github.event.pull_request.title }}" == *"[전체 리뷰]"* ]]; then
-            echo "--- Full file review mode activated! ---"
+            echo "--- Full file review mode activated ---"
             REVIEW_TYPE="파일 전체"
             
             # 변경된 파이썬(.py) 파일 목록 중 첫 번째 파일의 이름을 찾습니다.
             TARGET_FILE=$(git diff --name-only origin/${{ github.base_ref }}...HEAD | grep '\.py$' | head -n 1)
             
-            # 만약 대상 파일이 있다면, 그 파일의 전체 내용을 읽어옵니다.
+            # 대상 파일이 있다면, 그 파일의 전체 내용을 읽어옵니다.
             if [[ -n "$TARGET_FILE" ]]; then
               echo "Target file for full review: $TARGET_FILE"
               REVIEW_CONTENT=$(cat "$TARGET_FILE")
             else
-              echo "No Python file found for full review. Using diff instead."
+              echo "No Python file changed for full review. Using diff instead."
             fi
           fi
 
-          # 다음 단계에서 사용할 수 있도록 내용을 저장합니다.
-          echo "content<<EOF" >> $GITHUB_OUTPUT
-          echo "$REVIEW_CONTENT" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+          # 다음 단계에서 사용할 수 있도록 내용을 파일에 저장합니다.
+          # 이 방식은 특수문자 문제를 가장 확실하게 방지합니다.
+          echo "$REVIEW_CONTENT" > review_content.txt
           echo "type=$REVIEW_TYPE" >> $GITHUB_OUTPUT
-          
+
+      # 3. jq 도구 설치
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
 
+      # 4. OpenAI API 호출
       - name: Call OpenAI API
         id: openai
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
           set -e
+
+          # 파일에서 리뷰할 내용을 읽어옵니다.
+          REVIEW_CONTENT=$(cat review_content.txt)
           
-          # [수정된 부분] 리뷰 타입에 따라 프롬프트를 다르게 설정합니다.
-          if [[ "${{ steps.get_content.outputs.type }}" == "파일 전체" ]]; then
-            PROMPT="You are a senior QA engineer. Analyze the following ENTIRE a Python code file and provide a concise review comment in Korean. Mention bugs, improvements, or risks if any."
+          if [[ "${{ steps.prepare_content.outputs.type }}" == "파일 전체" ]]; then
+            PROMPT="You are a senior QA engineer. Analyze the following ENTIRE Python code file and provide a concise review comment in Korean. Mention bugs, improvements, or risks if any."
           else
             PROMPT="You are a senior QA engineer. Analyze the following code DIFF and provide a concise review comment in Korean. Mention bugs, improvements, or risks if any."
           fi
           
+          # jq를 사용하여 안전하게 JSON 요청 본문을 생성합니다.
           JSON_PAYLOAD=$(jq -n \
             --arg prompt "$PROMPT" \
-            --arg content "${{ steps.get_content.outputs.content }}" \
+            --arg content "$REVIEW_CONTENT" \
             '{
               "model": "gpt-3.5-turbo",
               "messages": [
@@ -74,26 +86,32 @@ jobs:
               ]
             }')
 
-          curl -s https://api.openai.com/v1/chat/completions \
+          curl -s -f -w "\nHTTP_STATUS_CODE:%{http_code}\n" \
+            https://api.openai.com/v1/chat/completions \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer $OPENAI_API_KEY" \
-            -d "$JSON_PAYLOAD" > response.json
+            -d "$JSON_PAYLOAD" > response_with_status.txt || true
 
-          echo "--- Received a raw response from OpenAI ---"
+          # HTTP 상태 코드를 분리합니다.
+          HTTP_STATUS=$(grep "HTTP_STATUS_CODE:" response_with_status.txt | cut -d: -f2)
+          # 순수 응답 본문을 분리합니다.
+          grep -v "HTTP_STATUS_CODE:" response_with_status.txt > response.json
+
+          echo "--- OpenAI API Response (Status: $HTTP_STATUS) ---"
           cat response.json
           
-          if jq -e .error < response.json > /dev/null; then
+          if [[ "$HTTP_STATUS" -ne 200 ]] || jq -e .error < response.json > /dev/null; then
             ERROR_MESSAGE=$(jq -r .error.message < response.json)
-            MESSAGE="### ❗ AI 리뷰 생성 실패\n\n**원인:** ${ERROR_MESSAGE}"
+            MESSAGE="### ❗ AI 리뷰 생성 실패 (HTTP 상태: $HTTP_STATUS)\n\n**원인:** ${ERROR_MESSAGE:-알 수 없는 에러}"
           else
             MESSAGE=$(jq -r '.choices[0].message.content // "리뷰 내용을 받아오지 못했습니다."')
-            # [수정된 부분] 리뷰 타입을 댓글에 명시합니다.
-            MESSAGE="### 🤖 AI 코드 리뷰 (${{ steps.get_content.outputs.type }})\n\n${MESSAGE}"
+            MESSAGE="### 🤖 AI 코드 리뷰 (${{ steps.prepare_content.outputs.type }})\n\n${MESSAGE}"
           fi
           
           echo "$MESSAGE" > summary.txt
           echo "summary_path=summary.txt" >> "$GITHUB_OUTPUT"
 
+      # 5. AI 리뷰를 PR에 코멘트로 작성
       - name: Post AI Review as Comment
         uses: actions/github-script@v7
         with:
